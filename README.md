@@ -1,6 +1,6 @@
 # 冷链货物追责服务
 
-面向冷链货物追责的后端服务：录入货物与测温 / 交接事件，**按发生时间重建保管链**，自动识别越温区间并在交接时刻拆分责任。技术栈 **Python 3.11 + FastAPI + SQLAlchemy 2 + PostgreSQL**。
+面向冷链货物追责的后端服务：录入货物与测温 / 交接事件，登记**冷链车次**（同一车承载多票货物）、每票货物的**装卸时段**与**车载测温读数**，**按发生时间重建保管链与每票货物实际采用的测温时间线**，自动识别越温区间并在交接时刻拆分责任。技术栈 **Python 3.11 + FastAPI + SQLAlchemy 2 + PostgreSQL**。
 
 ## 一、一键启动（Docker Compose，含数据库初始化）
 
@@ -60,8 +60,15 @@ uvicorn app.main:app --reload --port 8000
 | `POST` | `/cargo` | 创建货物 |
 | `GET` | `/cargo` | 货物列表 |
 | `GET` | `/cargo/{cargo_id}` | 货物详情 |
-| `POST` | `/events` | 写入测温 / 交接事件 |
-| `GET` | `/cargo/{cargo_id}/events` | 按发生时间列出事件 |
+| `POST` | `/events` | 写入货物**自有**测温 / 交接事件 |
+| `GET` | `/cargo/{cargo_id}/events` | 按发生时间列出货物**自有**事件（不含车载读数） |
+| `POST` | `/trips` | 登记车次及每票货物的装卸时段 |
+| `GET` | `/trips` / `GET` `/trips/{trip_id}` | 车次列表 / 车次详情（含车上货物装卸时段） |
+| `POST` | `/trips/{trip_id}/cargos` | 向既有车次补录一票货物的装卸时段 |
+| `POST` | `/trips/{trip_id}/cargos/{cargo_id}/unload` | 登记卸车时刻（闭合装载时段） |
+| `POST` | `/vehicle-readings` | 写入车载测温原始读数（允许晚到） |
+| `GET` | `/trips/{trip_id}/readings` | 车次原始读数 + 各车上货物的采用 / 越温来源 |
+| `GET` | `/cargo/{cargo_id}/temperatures` | 货物实际采用的测温时间线（自有优先合并） |
 | `GET` | `/cargo/{cargo_id}/report` | **追责报告**：越温区间 + 责任片段 |
 | `GET` | `/cargo/{cargo_id}/responsibilities` | **责任确认**：全部已闭合区间的确认状态 |
 | `GET` | `/cargo/{cargo_id}/responsibilities/{interval_id}` | 单个已闭合区间的责任确认视图 |
@@ -129,7 +136,7 @@ uvicorn app.main:app --reload --port 8000
 
 ### 4. 责任确认 `GET /cargo/{cargo_id}/responsibilities[/{interval_id}]`
 
-围绕**已闭合**越温区间开展责任确认（开放区间不参与）。区间以**开启测温事件ID**作为区间标识（`interval_id` / `start_event_id`），响应同时给出结束测温事件ID、责任片段、**当前快照标识**、各责任方最新一条有效表态与汇总状态。
+围绕**已闭合**越温区间开展责任确认（开放区间不参与）。区间有**稳定标识** `interval_id`：货物自有测温开启时为开启测温事件ID，车载读数开启时为 `vehicle:<车载读数ID>`；响应同时给出开启 / 闭合读数来源（`opener_source` / `closer_source`）、责任片段、**当前快照标识**、各责任方最新一条有效表态与汇总状态。
 
 ```json
 {
@@ -199,33 +206,136 @@ uvicorn app.main:app --reload --port 8000
 
 头部还给出 `interval_exists`、`is_open`、`current_snapshot_id`。
 
+## 四点五、车次、装卸时段与车载读数
+
+### 7. 登记车次 `POST /trips`
+
+一次登记车次编号、车辆标识（可选）以及**每票货物的装卸时段**。装卸时段为左闭右开区间 `[loaded_at, unloaded_at)`，起点必须严格早于终点；`unloaded_at` 省略或为 `null` 表示货物仍在车上。
+
+```json
+{
+  "trip_id": "TRIP-001",
+  "truck_no": "京A-CC01",
+  "cargos": [
+    {
+      "cargo_id": "COLD-001",
+      "loaded_at": "2026-10-01T09:00:00+08:00",
+      "unloaded_at": "2026-10-01T18:00:00+08:00"
+    },
+    {
+      "cargo_id": "COLD-002",
+      "loaded_at": "2026-10-01T09:30:00+08:00"
+    }
+  ]
+}
+```
+
+* 同一车次编号 + **整批内容完全一致**重传 → `200`（幂等，返回车次现状）；编号已存在但内容不同 → `409 trip_exists`。
+* 时段非法（起点不早于终点）→ `422 invalid_loading_window`；装载时刻早于货物起始时间 → `422 loading_before_cargo_start`；批内同一货物出现两次 → `422 duplicate_cargo_in_batch`。
+* 任一货物不存在 → `404 cargo_not_found`。
+* **同一货物不得同时属于两个车次**：与该货物既有在车时段（可跨车次）重叠 → `409 cargo_already_on_trip`。相邻时段（前段右端 = 后段左端）不算重叠。
+* 整批为**一个事务**：任一校验失败，车次与全部窗口都不落库（不留部分记录）。
+
+### 8. 补录装卸
+
+* `POST /trips/{trip_id}/cargos`：请求体同单个窗口（`cargo_id` / `loaded_at` / `unloaded_at?`），向既有车次补录一票货物；车次不存在 `404 trip_not_found`，重叠 `409 cargo_already_on_trip`，同内容重传 `200`。
+* `POST /trips/{trip_id}/cargos/{cargo_id}/unload`：`{"unloaded_at": "..."}` 闭合在车时段；货物不在该车次 `404 cargo_not_on_trip`、已卸车 `409 already_unloaded`、卸车不晚于装车 `422 invalid_loading_window`。
+
+### 9. 车载读数 `POST /vehicle-readings`
+
+```json
+{
+  "reading_id": "rd-1",
+  "trip_id": "TRIP-001",
+  "occurred_at": "2026-10-01T10:00:00+08:00",
+  "temperature": "7.5"
+}
+```
+
+* 读数是车载探头的**原始事实**，允许**晚到**（乱序写入），写入时不要求货物/车次已有关联事件；是否作用于某票货物在查询 / 重建时计算。
+* **作用范围**：仅对读数时刻仍在车上的货物生效（`loaded_at <= t < unloaded_at`，未卸车时只要求 `loaded_at <= t`）；每票货物按**各自温度上限**独立判断越温。
+* **同刻自有优先**：同一货物在读数时刻存在货物自有测温时采用自有值，车载读数不进入该货物时间线，但**原始读数仍可经车次接口查询**。
+* 编号同内容重传 → `200 {"replayed": true, ...}`；编号异内容 → `409 reading_id_conflict`；同车次同一时刻另一读数 → `409 same_timestamp_conflict`；车次不存在 → `404 trip_not_found`。
+
+### 10. 查询车次读数 `GET /trips/{trip_id}/readings`
+
+返回车次全部原始读数（按时间），每笔附读数时刻车上货物的采用情况：
+
+```json
+{
+  "trip_id": "TRIP-001",
+  "readings": [
+    {
+      "reading_id": "rd-1",
+      "trip_id": "TRIP-001",
+      "occurred_at": "2026-10-01T02:00:00Z",
+      "temperature": "4.500",
+      "applies_to": [
+        {
+          "cargo_id": "COLD-001",
+          "temp_upper_limit": "4.000",
+          "is_over_limit": true,
+          "adopted": false,
+          "own_event_id": "evt-own-9"
+        },
+        {
+          "cargo_id": "COLD-002",
+          "temp_upper_limit": "6.000",
+          "is_over_limit": false,
+          "adopted": true,
+          "own_event_id": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+`is_over_limit` 始终按原始读数对该货物上限判定（供溯源）；`adopted=false` 表示该货物同刻有自有测温（给出 `own_event_id`）。读数时刻不在车上的货物不出现。
+
+### 11. 查询货物测温时间线 `GET /cargo/{cargo_id}/temperatures`
+
+返回该货物**实际采用**的测温点（货物自有测温 + 生效车载读数，已按同刻自有优先合并，按时间升序），每个点给 `source`（`own` / `vehicle`）、`event_id` / `reading_id` / `trip_id`、`is_over_limit`。
+
+### 12. 车载读数与追责 / 责任确认
+
+* 追责报告（`/report`）与责任确认（`/responsibilities`）按**合并后的测温时间线**重建；越温区间额外返回 `opener_source` / `closer_source`（`own` / `vehicle`）、`start_event_id` / `start_reading_id` / `start_trip_id` / `end_event_id` / `end_reading_id`。
+* **保管方（责任片段）只由货物自有交接事件改变**；车载读数不产生交接。
+* 车载读数开启的区间，稳定标识为 **`vehicle:<reading_id>`**（自有测温开启的区间仍为开启事件ID）；表态、历史查询、快照校验对两类区间完全一致，URL 中的 `interval_id` 直接使用该标识（冒号无需编码）。
+* 货物**自有事件列表**（`GET /cargo/{id}/events`）仍只列货物自有事件；车载读数只在车次读数接口与货物测温时间线中出现。
+
 ## 五、业务规则
 
 1. **时间合法性**：事件发生时间早于货物起始时间 → `422 before_start`，拒绝。
-2. **越温区间**：
-   - 测温 **高于** 温度上限（`temp > limit`，等于上限不算越温）开启区间；
-   - 区间内首次 **不超温**（`temp <= limit`）的测温在其测温时刻闭合区间；
-   - 区间内重复超限测温不另开区间；区间外的不超限测温无影响。
-3. **责任拆分**：区间跨越交接时，按交接时刻切分——`[区间起, 交接时刻)` 归交出方，**交接时刻起归接收方**；不产生零长度片段。
-4. **晚到记录**：事件允许乱序写入。每次写入都把候选事件并入既有事件，按发生时间整体重算受影响区间；因此交接、测温可事后补录。
-5. **交接合法性（整体拒绝）**：任何一笔交接的交出方必须等于其发生时刻的保管方；晚到插入若导致此前已存在的交接不再满足该条件，本次写入**整体回滚拒绝，既有结果保持不变**（`422 giver_mismatch`）。
-6. **同刻冲突**：同一货物同一时刻至多一笔测温、至多一笔交接（测温与交接可同刻发生，且测温先于交接处理），冲突 → `409 same_timestamp_conflict`。
-7. **幂等**：同一 `event_id` 重传：内容完全一致（时间按同一时刻归一化比较）返回 `200 {"replayed": true}` 且不重复写入；内容不一致返回 `409 event_id_conflict`，原记录不变。
-8. **并发**：同一货物的写入在事务中以 `SELECT ... FOR UPDATE` 锁定货物行串行化，并由部分唯一索引 / CHECK 约束在数据库层兜底。**责任表态提交与事件写入共用同一把货物行锁**，二者对同一货物严格串行。
-9. **责任确认（仅已闭合区间）**：
-   - 区间标识 = 开启区间的测温事件ID；快照标识由区间起止与责任片段序列的 SHA-256 决定；
-   - 表态为只追加记录：同编号同内容重传返回原记录（快照失效亦然），同编号异内容冲突，改口必须用新编号且历次表态保留；
-   - 新表态以当前快照校验（过期拒绝），责任方必须在当前片段中；区间不存在 / 开放均拒绝且不落库；
-   - 晚到事件重建后：边界或责任片段变化的旧表态失效、未变化片段上的表态继续有效，全部历史仍可查。
+2. **测温时间线合并（车次 / 车载）**：
+   - 货物的测温时间线 = 货物自有测温事件 + 车载读数；车载读数只对**读数时刻仍在车上**的货物生效（装载时段左闭右开），并按**该货物自身温度上限**判越温；
+   - 同一时刻两类读数并存时，**货物自有测温优先**，该车载读数对该货物不生效（原始读数仍可在车次接口查到）；
+   - **交接只由货物自有事件改变保管方**，车载读数不产生交接。
+3. **越温区间**：
+   - 采用读数 **高于** 温度上限（`temp > limit`，等于上限不算越温）开启区间；
+   - 区间内首次 **不超温**（`temp <= limit`）的采用读数在其读数时刻闭合区间；
+   - 区间内重复超限读数不另开区间；区间外的不超限读数无影响。
+4. **责任拆分**：区间跨越交接时，按交接时刻切分——`[区间起, 交接时刻)` 归交出方，**交接时刻起归接收方**；不产生零长度片段。
+5. **晚到记录**：自有事件与车载读数都允许乱序写入。每次写入都把候选记录并入既有数据，按发生时间整体重算受影响区间；因此交接、测温、车载读数均可事后补录。
+6. **交接合法性（整体拒绝）**：任何一笔交接的交出方必须等于其发生时刻的保管方；晚到插入若导致此前已存在的交接不再满足该条件，本次写入**整体回滚拒绝，既有结果保持不变**（`422 giver_mismatch`）。
+7. **同刻冲突**：同一货物同一时刻至多一笔自有测温、至多一笔交接（测温与交接可同刻发生，且测温先于交接处理），冲突 → `409 same_timestamp_conflict`；同一车次同一时刻至多一笔车载读数；车载读数与货物自有测温同刻不互斥（按自有优先合并）。
+8. **装载时段**：左闭右开且起点严格早于终点；同一货物任意两个装载时段（含跨车次、批内）不得重叠；时段 / 货物 / 车次任一非法，车次登记整体回滚不留部分记录。
+9. **幂等**：同一 `event_id` / `reading_id` / 车次编号 重传：内容完全一致（时间按同一时刻归一化比较；车次为整批窗口一致）返回 `200 {"replayed": true}`（车次幂等返回车次现状）且不重复写入；内容不一致返回对应 `409 *_conflict`，原记录不变。
+10. **并发（串行一致）**：车次登记 / 装卸 / 车载读数 / 货物自有事件 / 责任表态对**同一货物**在事务中按固定顺序（货物行优先、按货物编号排序）取 `SELECT ... FOR UPDATE` 行锁串行化，并由部分唯一索引 / CHECK 约束在数据库层兜底。车载读数写入与**读数时刻在车上的全部货物**的事件写入、责任表态互斥。
+11. **责任确认（仅已闭合区间）**：
+    - 区间稳定标识 = 开启事件ID，或 `vehicle:<开启车载读数ID>`；快照标识由区间起止与责任片段序列的 SHA-256 决定；
+    - 表态为只追加记录：同编号同内容重传返回原记录（快照失效亦然），同编号异内容冲突，改口必须用新编号且历次表态保留；
+    - 新表态以当前快照校验（过期拒绝），责任方必须在当前片段中；区间不存在 / 开放均拒绝且不落库；
+    - 晚到事件 / 晚到车载读数重建后：边界或责任片段变化的旧表态失效、未变化片段上的表态继续有效，全部历史仍可查。
 
 错误响应统一格式：`{"error": {"code": "...", "message": "..."}}`。
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
-| 404 | `cargo_not_found` / `interval_not_found` | 货物或已闭合区间不存在 |
-| 409 | `cargo_exists` / `event_id_conflict` / `same_timestamp_conflict` / `integrity_conflict` / `stance_id_conflict` / `stale_snapshot` | 编号或同刻冲突、表态编号冲突、快照过期 |
-| 422 | `before_start` / `giver_mismatch` / `bad_event_shape` / `interval_open` / `party_not_in_segment` / `bad_stance_shape` / `dispute_reason_required` | 业务校验失败（整体拒绝、不落库） |
-| 200 | 响应体 `replayed=true` | 事件 / 表态同 ID 同内容幂等重传 |
+| 404 | `cargo_not_found` / `interval_not_found` / `trip_not_found` / `cargo_not_on_trip` | 货物、已闭合区间、车次不存在，或货物不在该车次上 |
+| 409 | `cargo_exists` / `event_id_conflict` / `same_timestamp_conflict` / `integrity_conflict` / `stance_id_conflict` / `stale_snapshot` / `trip_exists` / `cargo_already_on_trip` / `already_unloaded` / `reading_id_conflict` | 编号或同刻冲突、在车时段重叠、已卸车、表态编号冲突、快照过期 |
+| 422 | `before_start` / `giver_mismatch` / `bad_event_shape` / `interval_open` / `party_not_in_segment` / `bad_stance_shape` / `dispute_reason_required` / `invalid_loading_window` / `loading_before_cargo_start` / `duplicate_cargo_in_batch` | 业务校验失败（整体拒绝、不落库） |
+| 200 | 响应体 `replayed=true`（事件 / 表态 / 车载读数）或车次现状 | 同 ID 同内容幂等重传 |
 
 ## 六、调用示例
 
@@ -244,30 +354,31 @@ python examples/python_client.py
 ```bash
 pip install pytest httpx
 
-pytest -q                                          # 52 个用例（内存库），并发用例自动跳过
+pytest -q                                          # 内存库用例，并发用例自动跳过
 DATABASE_URL="sqlite:////tmp/cc.db" \
-  pytest tests/test_concurrency.py -q              # 2 个并发串行化用例（事件 / 表态，需文件型库）
+  pytest tests/test_concurrency.py -q              # 并发串行化用例（自有事件 / 表态 / 车次重叠 / 车载读数，需文件型库）
 ```
 
-测试覆盖：越温开闭、跨交接责任拆分、同刻测温+交接、未闭合区间、晚到重算、交出方整体拒绝、同刻冲突、幂等重传、并发写入串行化，以及责任确认的快照校验、确认/异议、汇总状态、表态幂等与改口、晚到事件后表态逐片段失效与历史可查等。
+测试覆盖：越温开闭、跨交接责任拆分、同刻测温+交接、未闭合区间、晚到重算、交出方整体拒绝、同刻冲突、幂等重传、并发写入串行化，责任确认的快照校验、确认/异议、汇总状态、表态幂等与改口、晚到事件后表态逐片段失效与历史可查；以及车次多票登记与整体回滚、装卸时段左闭右开 / 重叠拒绝 / 相邻允许、车载读数仅作用于在车上货物、按各自上限判越温、同刻自有优先（原始读数仍可查）、交接只由自有事件改变、车载读数晚到合并重建、车载读数开启区间的稳定标识 `vehicle:<reading_id>` 与表态 / 晚到失效。
 
 ## 八、目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py            # FastAPI 路由与异常映射
-│   ├── crud.py            # 事件写入事务、幂等、整链校验
-│   ├── stance_crud.py     # 责任表态写入事务（与事件共用货物行锁）
-│   ├── chain.py           # 保管链重建 / 越温责任拆分（纯函数）
+│   ├── main.py            # FastAPI 路由与异常映射（货物 / 事件 / 车次 / 读数 / 追责）
+│   ├── crud.py            # 货物自有事件写入事务、幂等、整链校验
+│   ├── trip_crud.py       # 车次 / 装载时段 / 车载读数事务（货物行优先的加锁顺序）
+│   ├── stance_crud.py     # 责任表态写入事务（与事件 / 读数共用货物行锁）
+│   ├── chain.py           # 自有+车载时间线合并、保管链重建、越温责任拆分（纯函数）
 │   ├── responsibility.py  # 快照标识、表态有效性、确认汇总（纯逻辑）
-│   ├── models.py          # SQLAlchemy 模型（货物 / 事件 / 表态）
+│   ├── models.py          # SQLAlchemy 模型（货物 / 事件 / 车次 / 装载 / 车载读数 / 表态）
 │   ├── schemas.py         # Pydantic 请求/响应模型
 │   ├── database.py        # 引擎、Session（含 SQLite 兼容）
 │   └── timeutil.py        # UTC 归一化
 ├── db/init.sql            # PostgreSQL 初始化（枚举、表、约束、索引）
-├── examples/              # curl / Python 调用示例（含责任确认完整链路）
-├── tests/                 # pytest 单元 + API + 责任确认 + 并发测试
+├── examples/              # curl / Python 调用示例（含车次 + 车载读数完整链路）
+├── tests/                 # pytest 单元 + API + 车次/读数 + 责任确认 + 并发测试
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

@@ -78,11 +78,29 @@ class ResponsibilitySegment(BaseModel):
 class Excursion(BaseModel):
     """一次越温区间及其责任拆分。"""
 
-    start: datetime = Field(..., description="越温开始（首次超限测温时刻，含）")
+    start: datetime = Field(..., description="越温开始（首个超限采用读数时刻，含）")
     end: datetime | None = Field(
-        ..., description="越温结束（首次不超限测温时刻，不含）；null=未闭合"
+        ..., description="越温结束（首个不超限采用读数时刻，不含）；null=未闭合"
     )
     is_open: bool = Field(..., description="是否尚未闭合（未结束）")
+    opener_source: str = Field(
+        ..., description="开启区间的读数来源：own=货物自有测温；vehicle=车载读数"
+    )
+    closer_source: str | None = Field(
+        None, description="闭合区间的读数来源：own / vehicle；未闭合为 null"
+    )
+    start_event_id: str | None = Field(
+        None, description="货物自有测温开启时的事件ID"
+    )
+    start_reading_id: str | None = Field(
+        None, description="车载读数开启时的读数ID"
+    )
+    start_trip_id: str | None = Field(None, description="车载开启时所属车次")
+    end_event_id: str | None = Field(None, description="货物自有测温闭合时的事件ID")
+    end_reading_id: str | None = Field(None, description="车载读数闭合时的读数ID")
+    interval_id: str = Field(
+        ..., description="区间稳定标识：开启事件ID，或 vehicle:<车载读数ID>"
+    )
     segments: list[ResponsibilitySegment] = Field(..., description="责任方片段")
 
 
@@ -99,6 +117,122 @@ class IdempotentReplay(BaseModel):
     replayed: bool = True
     event_id: str
     message: str
+
+
+# ----------------------------------------------------- 车次 / 装载 / 车载读数
+
+
+class TripWindowCreate(BaseModel):
+    """登记车次时一票货物的装卸时段：左闭右开，unloaded_at 可空表示仍在车上。"""
+
+    cargo_id: str = Field(..., min_length=1, max_length=64)
+    loaded_at: datetime = Field(..., description="装载时刻（含）")
+    unloaded_at: datetime | None = Field(
+        default=None, description="卸车时刻（不含）；null 或省略表示仍在车上"
+    )
+
+
+class TripCreate(BaseModel):
+    trip_id: str = Field(..., min_length=1, max_length=64, description="车次编号")
+    truck_no: str | None = Field(default=None, max_length=64, description="车牌等车辆标识")
+    cargos: list[TripWindowCreate] = Field(
+        ..., min_length=1, description="本车次承载的货物及其装卸时段（至少一票）"
+    )
+
+
+class TripWindowOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    cargo_id: str
+    loaded_at: datetime
+    unloaded_at: datetime | None
+
+
+class TripOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    trip_id: str
+    truck_no: str | None
+    created_at: datetime
+    cargos: list[TripWindowOut] = Field(..., description="车上货物及装卸时段（按货物编号）")
+
+
+class TripCargoCreate(TripWindowCreate):
+    """向既有车次补录一票货物的装卸时段。"""
+
+
+class UnloadCreate(BaseModel):
+    unloaded_at: datetime = Field(..., description="卸车时刻（不含该时刻，须晚于装载时刻）")
+
+
+class VehicleReadingCreate(BaseModel):
+    reading_id: str = Field(..., min_length=1, max_length=64, description="车载读数编号（客户端指定）")
+    trip_id: str = Field(..., min_length=1, max_length=64, description="所属车次")
+    occurred_at: datetime = Field(..., description="读数时刻（ISO 8601，建议带时区），允许晚到")
+    temperature: Decimal = Field(..., description="车载探头读数（摄氏度）")
+
+
+class VehicleReadingOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    reading_id: str
+    trip_id: str
+    occurred_at: datetime
+    temperature: Decimal
+    created_at: datetime
+
+
+class ReadingReplay(BaseModel):
+    replayed: bool = True
+    reading: VehicleReadingOut
+    message: str
+
+
+class ReadingAppliedCargo(BaseModel):
+    """车载读数对一票车上货物的作用情况。"""
+
+    cargo_id: str
+    temp_upper_limit: Decimal = Field(..., description="该货物自身温度上限（各自判越温）")
+    is_over_limit: bool = Field(..., description="本读数相对该货物上限是否越温")
+    adopted: bool = Field(
+        ..., description="是否被该货物采用：同刻有货物自有测温时为 false（自有优先）"
+    )
+    own_event_id: str | None = Field(
+        ..., description="未采用时遮蔽本读数的货物自有测温事件ID；采用时为 null"
+    )
+
+
+class TripReadingItem(VehicleReadingOut):
+    applies_to: list[ReadingAppliedCargo] = Field(
+        ...,
+        description="读数时刻仍在车上的货物及其采用情况（不在车的货物不出现在此）",
+    )
+
+
+class TripReadingsReport(BaseModel):
+    trip_id: str
+    readings: list[TripReadingItem] = Field(..., description="车次全部原始车载读数（按时间）")
+
+
+class CargoTemperaturePoint(BaseModel):
+    """货物测温时间线上的一个采用读数（自有 + 生效车载，已按自有优先合并）。"""
+
+    occurred_at: datetime
+    temperature: Decimal
+    source: str = Field(..., description="own=货物自有测温；vehicle=车载读数")
+    event_id: str | None = Field(None, description="source=own 时的事件ID")
+    reading_id: str | None = Field(None, description="source=vehicle 时的车载读数ID")
+    trip_id: str | None = Field(None, description="source=vehicle 时所属车次")
+    temp_upper_limit: Decimal = Field(..., description="该货物温度上限")
+    is_over_limit: bool = Field(..., description="是否高于该货物温度上限")
+
+
+class CargoTimelineOut(BaseModel):
+    cargo_id: str
+    temp_upper_limit: Decimal
+    readings: list[CargoTemperaturePoint] = Field(
+        ..., description="该货物实际采用的测温时间线（自有优先合并后，按时间升序）"
+    )
 
 
 # ----------------------------------------------------- 责任确认
@@ -165,9 +299,16 @@ class ResponsibilityInterval(BaseModel):
     """一个已闭合越温区间的责任确认视图。"""
 
     cargo_id: str
-    interval_id: str = Field(..., description="区间标识 = 开启测温事件ID")
-    start_event_id: str
-    end_event_id: str = Field(..., description="结束区间的测温事件ID")
+    interval_id: str = Field(
+        ..., description="区间稳定标识 = 开启事件ID，或 vehicle:<车载读数ID>"
+    )
+    opener_source: str = Field(..., description="开启来源：own / vehicle")
+    closer_source: str | None = Field(None, description="闭合来源：own / vehicle")
+    start_event_id: str | None = Field(None, description="自有测温开启时的事件ID")
+    start_reading_id: str | None = Field(None, description="车载读数开启时的读数ID")
+    start_trip_id: str | None = Field(None, description="车载开启时所属车次")
+    end_event_id: str | None = Field(None, description="结束区间的自有测温事件ID")
+    end_reading_id: str | None = Field(None, description="结束区间的车载读数ID")
     start: datetime
     end: datetime
     snapshot_id: str = Field(..., description="当前快照标识（区间起止 + 责任片段）")
@@ -195,8 +336,9 @@ class StanceOut(BaseModel):
 
     stance_id: str
     cargo_id: str
-    interval_id: str = Field(..., description="区间标识 = start_event_id")
-    start_event_id: str
+    interval_id: str = Field(
+        ..., description="区间稳定标识 = 开启事件ID，或 vehicle:<车载读数ID>"
+    )
     responsible_party: str
     stance: StanceKind
     reason: str | None

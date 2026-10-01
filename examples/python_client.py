@@ -190,6 +190,190 @@ def main() -> None:
             api.get(f"/cargo/{CARGO}/responsibilities/{iid}"),
         )
 
+        # ============== 本轮新增：车次 / 多票货物 / 车载读数 ==============
+        c2, c3 = "COLD-TRIP-A", "COLD-TRIP-B"
+        for cid, limit, holder in [
+            (c2, "4.0", "北京冷库"),
+            (c3, "6.0", "天津冷库"),
+        ]:
+            show(
+                f"创建货物 {cid}（上限 {limit}℃）",
+                api.post(
+                    "/cargo",
+                    json={
+                        "cargo_id": cid,
+                        "started_at": "2026-10-01T08:00:00+08:00",
+                        "temp_upper_limit": limit,
+                        "initial_holder": holder,
+                    },
+                ),
+            )
+
+        # 一次登记车次 + 每票货物的装卸时段（左闭右开；c3 暂未卸车）
+        show(
+            "登记车次（A 09:00-18:00；B 09:30 起仍在车上）",
+            api.post(
+                "/trips",
+                json={
+                    "trip_id": "TRIP-PY-1",
+                    "truck_no": "京A-CC01",
+                    "cargos": [
+                        {
+                            "cargo_id": c2,
+                            "loaded_at": "2026-10-01T09:00:00+08:00",
+                            "unloaded_at": "2026-10-01T18:00:00+08:00",
+                        },
+                        {"cargo_id": c3, "loaded_at": "2026-10-01T09:30:00+08:00"},
+                    ],
+                },
+            ),
+        )
+
+        # 车载读数 4.5℃：A 上限 4 -> 越温；B 上限 6 -> 不越温（各自上限）
+        show(
+            "车载读数 10:00 4.5℃",
+            api.post(
+                "/vehicle-readings",
+                json={
+                    "reading_id": "rd-py-1",
+                    "trip_id": "TRIP-PY-1",
+                    "occurred_at": "2026-10-01T10:00:00+08:00",
+                    "temperature": "4.5",
+                },
+            ),
+        )
+
+        # 同刻 A 有自有测温 3.0℃：A 采用自有值，车载读数被遮蔽（原始仍可查）
+        show(
+            "A 同刻自有测温 3.0℃（自有优先）",
+            api.post(
+                "/events",
+                json={
+                    "event_id": "a-own",
+                    "cargo_id": c2,
+                    "occurred_at": "2026-10-01T10:00:00+08:00",
+                    "temperature": "3.0",
+                },
+            ),
+        )
+
+        # 12:00 车载 7.0℃：A、B 都在车上且越限，各自开启越温区间
+        show(
+            "车载读数 12:00 7.0℃（开启区间）",
+            api.post(
+                "/vehicle-readings",
+                json={
+                    "reading_id": "rd-py-2",
+                    "trip_id": "TRIP-PY-1",
+                    "occurred_at": "2026-10-01T12:00:00+08:00",
+                    "temperature": "7.0",
+                },
+            ),
+        )
+
+        # A 的交接（保管方只由货物自有事件改变），责任在 13:00 拆分
+        show(
+            "A 交接 北京->上海",
+            api.post(
+                "/events",
+                json={
+                    "event_id": "a-hand",
+                    "cargo_id": c2,
+                    "occurred_at": "2026-10-01T13:00:00+08:00",
+                    "giver": "北京冷库",
+                    "receiver": "上海冷库",
+                },
+            ),
+        )
+
+        # 15:00 车载 2.0℃ 闭合区间（车载读数允许晚到：换个更早时刻补录也会重算）
+        show(
+            "车载读数 15:00 2.0℃（闭合区间）",
+            api.post(
+                "/vehicle-readings",
+                json={
+                    "reading_id": "rd-py-3",
+                    "trip_id": "TRIP-PY-1",
+                    "occurred_at": "2026-10-01T15:00:00+08:00",
+                    "temperature": "2.0",
+                },
+            ),
+        )
+
+        show("车次读数（原始读数 + 每票货物采用/越限来源）",
+             api.get("/trips/TRIP-PY-1/readings"))
+        show("A 的采用测温时间线（自有优先）", api.get(f"/cargo/{c2}/temperatures"))
+        show("A 的追责报告（区间标识 vehicle:rd-py-2）", api.get(f"/cargo/{c2}/report"))
+        show("B 的追责报告（上限 6，rd-py-1 不越温）", api.get(f"/cargo/{c3}/report"))
+
+        # 对车载读数开启的区间表态：区间稳定标识 vehicle:<reading_id>
+        resp = api.get(f"/cargo/{c2}/responsibilities")
+        intervals = resp.json().get("intervals", [])
+        if intervals:
+            iv = intervals[0]
+            iid, snap = iv["interval_id"], iv["snapshot_id"]
+            print(f"\n车载区间标识={iid} 开启来源={iv['opener_source']} 快照={snap}")
+            show(
+                "北京冷库对车载区间确认",
+                api.post(
+                    f"/cargo/{c2}/responsibilities/{iid}/stances",
+                    json={
+                        "snapshot_id": snap,
+                        "responsible_party": "北京冷库",
+                        "stance": "confirm",
+                        "stance_id": "py-vehicle-stance-1",
+                    },
+                ),
+            )
+
+        # 非法：重叠在车时段 -> 409 cargo_already_on_trip（整体拒绝不留记录）
+        show(
+            "重叠在车时段登记另一车次（拒绝）",
+            api.post(
+                "/trips",
+                json={
+                    "trip_id": "TRIP-PY-BAD",
+                    "cargos": [
+                        {
+                            "cargo_id": c2,
+                            "loaded_at": "2026-10-01T10:00:00+08:00",
+                            "unloaded_at": "2026-10-01T11:00:00+08:00",
+                        }
+                    ],
+                },
+            ),
+        )
+        # 非法：装载时段起点不早于终点 -> 422 invalid_loading_window
+        show(
+            "空装载时段（拒绝）",
+            api.post(
+                "/trips",
+                json={
+                    "trip_id": "TRIP-PY-BAD2",
+                    "cargos": [
+                        {
+                            "cargo_id": c3,
+                            "loaded_at": "2026-10-01T09:00:00+08:00",
+                            "unloaded_at": "2026-10-01T09:00:00+08:00",
+                        }
+                    ],
+                },
+            ),
+        )
+        # 幂等：车载读数同编号同内容重传
+        show(
+            "车载读数幂等重传",
+            api.post(
+                "/vehicle-readings",
+                json={
+                    "reading_id": "rd-py-2",
+                    "trip_id": "TRIP-PY-1",
+                    "occurred_at": "2026-10-01T12:00:00+08:00",
+                    "temperature": "7.0",
+                },
+            ),
+        )
+
 
 if __name__ == "__main__":
     main()

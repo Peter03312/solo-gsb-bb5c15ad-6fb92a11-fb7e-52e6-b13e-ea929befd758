@@ -2,8 +2,9 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+from app import chain
 from app.chain import holder_at, rebuild_chain
-from app.models import Event, EventType
+from app.models import Event, EventType, TripCargo, VehicleReading
 
 T0 = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
 
@@ -129,3 +130,67 @@ def test_holder_at_with_handovers():
     assert holder_at("A", events, T0 + timedelta(minutes=30)) == "B"
     assert holder_at("A", events, T0 + timedelta(minutes=45)) == "B"
     assert holder_at("A", events, T0 + timedelta(minutes=60)) == "C"
+
+
+# ------------------------------------------------------- 车载读数合并
+
+
+def window(loaded_min, unloaded_min=None, trip="V1", cargo="C1"):
+    return TripCargo(
+        trip_id=trip,
+        cargo_id=cargo,
+        loaded_at=T0 + timedelta(minutes=loaded_min),
+        unloaded_at=(
+            T0 + timedelta(minutes=unloaded_min) if unloaded_min is not None else None
+        ),
+    )
+
+
+def vreading(rid, minute, temp, trip="V1"):
+    return VehicleReading(
+        reading_id=rid,
+        trip_id=trip,
+        occurred_at=T0 + timedelta(minutes=minute),
+        temperature=Decimal(temp),
+    )
+
+
+def vpoints(windows, readings):
+    return chain.applicable_vehicle_readings(windows, readings)
+
+
+def test_vehicle_reading_applicable_only_while_on_board():
+    wins = [window(0, 30)]
+    pts = vpoints(wins, [vreading("r0", 0, 8), vreading("r1", 25, 9), vreading("r2", 30, 9)])
+    # 左闭（00 含）右开（30 不含）
+    assert [p.source_id for p in pts] == ["r0", "r1"]
+
+
+def test_vehicle_reading_opens_and_closes_interval_with_stable_key():
+    events = [handover("h1", 30, "A", "B")]
+    pts = vpoints([window(0)], [vreading("r1", 10, 8), vreading("r2", 50, 2)])
+    r = rebuild_chain("A", Decimal("5"), events, pts)
+    ex = r.excursions[0]
+    assert ex.opener_source == "vehicle"
+    assert ex.start_reading_id == "r1"
+    assert ex.start_event_id is None
+    assert ex.closer_source == "vehicle"
+    assert ex.end_reading_id == "r2"
+    assert ex.interval_key == "vehicle:r1"
+    assert [(s.party) for s in ex.segments] == ["A", "B"]
+
+
+def test_own_measurement_shadows_vehicle_reading_at_same_instant():
+    # 同刻：车载 9（越温）vs 自有 3（不越温）-> 采用自有，无区间
+    pts = vpoints([window(0)], [vreading("r1", 10, 9)])
+    r = rebuild_chain("A", Decimal("5"), [meas("m1", 10, 3)], pts)
+    assert r.excursions == ()
+    assert [p.source for p in r.timeline] == ["own"]
+    assert [p.source_id for p in r.timeline] == ["m1"]
+
+
+def test_vehicle_reading_per_cargo_limit_and_handover_ownership_only_own():
+    # 同一车载读数对不同上限的货物结论不同（本测只建一单货物，用例覆盖上限行为）
+    pts = vpoints([window(0)], [vreading("r1", 10, "4.5")])
+    assert rebuild_chain("A", Decimal("4"), [], pts).excursions
+    assert rebuild_chain("A", Decimal("6"), [], pts).excursions == ()

@@ -100,8 +100,14 @@ class StanceView:
 @dataclass(frozen=True)
 class IntervalView:
     cargo_id: str
-    start_event_id: str
-    end_event_id: str
+    interval_key: str
+    start_event_id: str | None
+    start_reading_id: str | None
+    end_event_id: str | None
+    end_reading_id: str | None
+    opener_source: str          # own / vehicle
+    closer_source: str | None   # own / vehicle / None（未闭合）
+    start_trip_id: str | None
     start: datetime
     end: datetime
     snapshot_id: str
@@ -138,10 +144,12 @@ def build_interval_view(
     cargo_id: str,
     ex: ExcursionResult,
     stances: list[Stance],
+    chain_result=None,
 ) -> IntervalView:
     """组装单个已闭合区间的责任确认视图。
 
     ``stances`` 为该区间的全部表态行（含已被改口、已失效的历史行）。
+    ``chain_result`` 提供合并后的测温时间线，用于补全车载开启读数的车次。
     """
     for s in stances:
         s.created_at = ensure_utc(s.created_at)
@@ -183,10 +191,23 @@ def build_interval_view(
     else:
         summary = PENDING
 
+    start_trip_id = None
+    if chain_result is not None and ex.start_reading_id is not None:
+        for p in chain_result.timeline:
+            if p.source == "vehicle" and p.source_id == ex.start_reading_id:
+                start_trip_id = p.trip_id
+                break
+
     return IntervalView(
         cargo_id=cargo_id,
+        interval_key=ex.interval_key,
         start_event_id=ex.start_event_id,
+        start_reading_id=ex.start_reading_id,
         end_event_id=ex.end_event_id,
+        end_reading_id=ex.end_reading_id,
+        opener_source=ex.opener_source,
+        closer_source=ex.closer_source,
+        start_trip_id=start_trip_id,
         start=ex.start,
         end=ex.end,
         snapshot_id=snapshot_id(ex),
@@ -205,17 +226,27 @@ def build_interval_view(
 def rebuild(
     cargo,
     events: list[Event],
+    windows: list | None = None,
+    readings: list | None = None,
 ) -> tuple[object, dict[str, ExcursionResult]]:
     """重建保管链并返回（重建结果, 区间标识 -> 闭合区间）。
 
+    合并测温时间线 = 货物自有事件 + 读数时刻仍在车上的车载读数
+    （同刻自有优先）；交接仍只来自货物自有事件。
     延迟导入以避免与 crud 形成导入环。
     """
     from app import chain
 
+    vehicle_points = (
+        chain.applicable_vehicle_readings(windows or [], readings or [])
+    )
     result = chain.rebuild_chain(
-        cargo.initial_holder, Decimal(cargo.temp_upper_limit), events
+        cargo.initial_holder,
+        Decimal(cargo.temp_upper_limit),
+        events,
+        vehicle_points,
     )
     closed = {
-        ex.start_event_id: ex for ex in result.excursions if not ex.is_open
+        ex.interval_key: ex for ex in result.excursions if not ex.is_open
     }
     return result, closed

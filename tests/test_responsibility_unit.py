@@ -76,7 +76,7 @@ def test_attested_segments_per_party():
 
 def _stance(party, ex, sid="s1", kind=StanceKind.confirm, reason=None, at=T0):
     return Stance(
-        stance_id=sid, cargo_id="C1", start_event_id=ex.start_event_id,
+        stance_id=sid, cargo_id="C1", interval_key=ex.interval_key,
         responsible_party=party, kind=kind, reason=reason,
         snapshot_id=resp.snapshot_id(ex),
         attested_segments=resp.attested_segments_json(ex, party),
