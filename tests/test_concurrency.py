@@ -105,3 +105,69 @@ def test_concurrent_stance_submits_serialize_with_snapshot(client):
     assert codes.count(200) == 7
     hist = client.get("/cargo/CS/responsibilities/m1/stances").json()
     assert len(hist["history"]) == 1
+
+
+def test_concurrent_onboard_reading_and_event_serialize(client):
+    """车载读数写入与受影响货物的事件 / 表态写入串行一致。
+
+    多线程并发写同一时刻、不同编号的车载读数与货物自有测温：
+    数据库唯一约束（车次同刻）+ 货物行锁使其串行，结果必须自洽——
+    不会出现同一货物同刻既有被采用的车载读数又有自有测温的矛盾快照。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CT",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    client.post("/trips", json={"trip_id": "TT", "vehicle_no": "V"})
+    client.post(
+        "/trips/TT/loadings",
+        json={"loadings": [{
+            "cargo_id": "CT",
+            "loaded_at": "2026-01-01T10:00:00+00:00",
+            "unloaded_at": "2026-01-01T12:00:00+00:00",
+        }]},
+    )
+
+    def submit_reading(i):
+        return client.post(
+            "/trips/TT/readings",
+            json={
+                "reading_id": f"tr{i}",
+                "trip_id": "TT",
+                "read_at": "2026-01-01T11:00:00+00:00",
+                "temperature": "8",
+            },
+        ).status_code
+
+    def submit_event(i):
+        return client.post(
+            "/events",
+            json={
+                "event_id": f"te{i}",
+                "cargo_id": "CT",
+                "occurred_at": "2026-01-01T11:00:00+00:00",
+                "temperature": "9",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        reading_codes = list(pool.map(submit_reading, range(4)))
+        event_codes = list(pool.map(submit_event, range(4)))
+
+    # 车次同刻只有一笔读数成功（幂等编号都不同，故只有一笔 201，其余 409）
+    assert reading_codes.count(201) == 1
+    assert all(c == 409 for c in reading_codes if c != 201)
+    # 货物同刻只有一笔自有测温成功
+    assert event_codes.count(201) == 1
+    assert all(c in (409, 422) for c in event_codes if c != 201)
+
+    # 合并时间线自洽：该时刻自有测温优先，车载读数未被采用
+    readings = client.get("/cargo/CT/readings").json()["readings"]
+    at_11 = [r for r in readings if r["occurred_at"].startswith("2026-01-01T11:00:00")]
+    adopted = [r for r in at_11 if r["adopted"]]
+    assert len(adopted) == 1 and adopted[0]["source"] == "own"

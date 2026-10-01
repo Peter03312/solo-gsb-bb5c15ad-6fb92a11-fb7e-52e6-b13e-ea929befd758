@@ -109,6 +109,12 @@ class IntervalView:
     parties: tuple[str, ...]
     stances: tuple[StanceView, ...]
     summary: str
+    start_source: str = "own"          # own / onboard
+    end_source: str | None = None
+    start_point_id: str | None = None  # 去掉 onboard: 前缀的原始测温标识
+    end_point_id: str | None = None
+    start_trip_id: str | None = None
+    end_trip_id: str | None = None
 
 
 def _segments_of_party(ex: ExcursionResult, party: str) -> tuple[SegmentView, ...]:
@@ -199,21 +205,35 @@ def build_interval_view(
         parties=parties,
         stances=tuple(stance_views),
         summary=summary,
+        start_source=ex.start_source,
+        end_source=ex.end_source,
+        start_point_id=ex.start_point_id,
+        end_point_id=ex.end_point_id,
+        start_trip_id=ex.start_trip_id,
+        end_trip_id=ex.end_trip_id,
     )
 
 
 def rebuild(
     cargo,
-    events: list[Event],
-) -> tuple[object, dict[str, ExcursionResult]]:
+    events: list[Event] | None = None,
+    *,
+    timeline=None,
+):
     """重建保管链并返回（重建结果, 区间标识 -> 闭合区间）。
+
+    入参二选一：
+    * ``timeline``：app/timeline.py 合并后的追责时间线（自有事件 + 车载测温）；
+    * ``events``：仅货物自有事件（保留给测试 / 旧调用，等价于无车载读数）。
 
     延迟导入以避免与 crud 形成导入环。
     """
     from app import chain
 
+    if timeline is None:
+        timeline = events if events is not None else []
     result = chain.rebuild_chain(
-        cargo.initial_holder, Decimal(cargo.temp_upper_limit), events
+        cargo.initial_holder, Decimal(cargo.temp_upper_limit), list(timeline)
     )
     closed = {
         ex.start_event_id: ex for ex in result.excursions if not ex.is_open

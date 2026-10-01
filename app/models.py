@@ -11,6 +11,7 @@ from sqlalchemy import (
     Index,
     Numeric,
     String,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -117,6 +118,9 @@ class Stance(Base):
     表态是只追加（append-only）的：改口产生新编号的新记录，历次表态永久保留；
     晚到事件重建后若区间边界或责任片段变化，旧行不删除、不修改，
     其是否仍“有效”由查询时与当前快照比对得出（见 app/responsibility.py）。
+
+    ``start_event_id`` 为区间稳定标识：货物自有测温开启的区间用测温事件ID；
+    车载读数开启的区间用 ``onboard:<读数ID>``。因此这里**不**对 event 表建外键。
     """
 
     __tablename__ = "responsibility_stance"
@@ -135,12 +139,8 @@ class Stance(Base):
         ForeignKey("cargo.cargo_id", ondelete="RESTRICT"),
         nullable=False,
     )
-    # 区间标识 = 开启该区间的测温事件ID
-    start_event_id: Mapped[str] = mapped_column(
-        String(64),
-        ForeignKey("event.event_id", ondelete="RESTRICT"),
-        nullable=False,
-    )
+    # 区间稳定标识：自有测温事件ID，或 onboard:<车载读数ID>（长度容纳前缀）
+    start_event_id: Mapped[str] = mapped_column(String(128), nullable=False)
     responsible_party: Mapped[str] = mapped_column(String(128), nullable=False)
     kind: Mapped[StanceKind] = mapped_column(
         Enum(StanceKind, name="stance_kind", create_constraint=True),
@@ -152,6 +152,99 @@ class Stance(Base):
     # 表态时该责任方承担的片段坐标（规范化 JSON：[[start,end,party],...]）。
     # 晚到事件重建后据此逐片段判定表态是否仍有效（未变化片段继续有效）。
     attested_segments: Mapped[str] = mapped_column(String(2000), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class Trip(Base):
+    """一辆冷链车的一次车次。"""
+
+    __tablename__ = "trip"
+
+    trip_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    vehicle_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class CargoLoading(Base):
+    """货物在某车次上的一个装载时段 [loaded_at, unloaded_at)（左闭右开）。
+
+    同货物不得同时属于两个车次：同一货物的装载时段两两不得相交
+    （首尾相接允许：上一段的卸载时刻可以是下一段的装载时刻）。
+    """
+
+    __tablename__ = "cargo_loading"
+    __table_args__ = (
+        CheckConstraint(
+            "loaded_at < unloaded_at", name="chk_loading_window"
+        ),
+        UniqueConstraint(
+            "trip_id", "cargo_id", name="ux_loading_trip_cargo"
+        ),
+        Index("ix_loading_cargo_window", "cargo_id", "loaded_at", "unloaded_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    trip_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("trip.trip_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    cargo_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("cargo.cargo_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    loaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    unloaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class OnboardReading(Base):
+    """车载测温设备在某车次上的一笔原始读数。
+
+    读数只作用于“读数时刻仍在车上”的货物（依据 cargo_loading 左闭右开判断）；
+    同一车次同一时刻至多一笔原始读数。原始读数始终保留可查，
+    是否被某货物追责时间线采用由查询时按装载时段与同刻自有测温合并决定。
+    """
+
+    __tablename__ = "onboard_reading"
+    __table_args__ = (
+        Index(
+            "ux_onboard_trip_time",
+            "trip_id",
+            "read_at",
+            unique=True,
+        ),
+        Index("ix_onboard_trip", "trip_id", "read_at"),
+    )
+
+    reading_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    trip_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("trip.trip_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    read_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    temperature: Mapped[Decimal] = mapped_column(Numeric(10, 3), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

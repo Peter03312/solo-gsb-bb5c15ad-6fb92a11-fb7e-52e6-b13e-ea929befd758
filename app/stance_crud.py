@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app import responsibility as resp
-from app.crud import ApiError, _load_cargo_locked, _load_events
+from app import timeline
+from app.crud import ApiError, _load_cargo_locked
 from app.models import Stance, StanceKind
 from app.schemas import StanceCreate
 
@@ -39,9 +40,9 @@ def _unprocessable(message: str, code: str) -> ApiError:
 
 
 def _rebuild_closed(db, cargo: Cargo):
-    """持锁/读事务内重建事件链，返回 (chain结果, 闭合区间映射)。"""
-    events = _load_events(db, cargo.cargo_id)
-    return resp.rebuild(cargo, events)
+    """持锁/读事务内按**合并后的追责时间线**重建，返回 (chain结果, 闭合区间映射)。"""
+    merged = timeline.build_cargo_timeline(db, cargo)
+    return resp.rebuild(cargo, timeline=list(merged.timeline))
 
 
 def _resolve_interval(db, cargo: Cargo, start_event_id: str, require_closed: bool = True):
